@@ -2,11 +2,15 @@
 """本地目录备份与恢复最小工具（快照版本 1）。
 
 用法:
-    python backup.py backup SOURCE SNAPSHOT
+    python backup.py backup SOURCE SNAPSHOT [--checksum]
     python backup.py restore SNAPSHOT DEST [--file PATH]...
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
+
+backup 传入 --checksum 时，清单中每个文件条目额外记录其原始字节的
+SHA-256 摘要；restore 会在创建恢复目录前逐条校验带摘要的文件，
+任一条目格式错误、内容不一致或无法读取都整体拒绝恢复。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -17,6 +21,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -28,6 +33,9 @@ MANIFEST_NAME = "manifest.json"
 DATA_DIRNAME = "data"
 FORMAT_VERSION = 1
 COPY_BUFFER_SIZE = 1024 * 1024
+CHECKSUM_FIELD = "sha256"
+CHECKSUM_HEX_LENGTH = 64
+_HEX_LOWER_DIGITS = frozenset("0123456789abcdef")
 
 EXIT_OK = 0
 EXIT_ERROR = 2
@@ -113,11 +121,32 @@ def _copy_bytes(src_path, dst_path):
             shutil.copyfileobj(src_f, dst_f, length=COPY_BUFFER_SIZE)
 
 
+def _sha256_file(path):
+    """计算普通文件字节的 SHA-256，返回六十四位小写十六进制字符串。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(COPY_BUFFER_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _is_valid_checksum_text(value):
+    """判断值是否为六十四位小写十六进制字符串。"""
+    if not isinstance(value, str):
+        return False
+    if len(value) != CHECKSUM_HEX_LENGTH:
+        return False
+    return all(ch in _HEX_LOWER_DIGITS for ch in value)
+
+
 def _remove_tree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def cmd_backup(source_arg, snapshot_arg):
+def cmd_backup(source_arg, snapshot_arg, checksum=False):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
 
@@ -154,6 +183,7 @@ def cmd_backup(source_arg, snapshot_arg):
         data_dir = snapshot / DATA_DIRNAME
         os.mkdir(data_dir)
 
+        file_entries = []
         for rel in rel_paths:
             parts = rel.split("/")
             src_file = source_resolved.joinpath(*parts)
@@ -164,9 +194,17 @@ def cmd_backup(source_arg, snapshot_arg):
             except OSError as exc:
                 fail(f"复制文件失败 {rel}: {exc}")
 
+            entry = {"path": rel}
+            if checksum:
+                try:
+                    entry[CHECKSUM_FIELD] = _sha256_file(src_file)
+                except OSError as exc:
+                    fail(f"计算文件摘要失败 {rel}: {exc}")
+            file_entries.append(entry)
+
         manifest = {
             "version": FORMAT_VERSION,
-            "files": [{"path": rel} for rel in rel_paths],
+            "files": file_entries,
         }
         manifest_tmp = snapshot / (MANIFEST_NAME + ".tmp")
         try:
@@ -249,6 +287,13 @@ def _load_manifest(snapshot):
             fail(f"清单包含重复文件路径: {normalized}")
         seen.add(normalized)
 
+        # 字段缺省表示无摘要；显式给出时必须是六十四位小写十六进制串。
+        checksum = None
+        if CHECKSUM_FIELD in item:
+            checksum = item[CHECKSUM_FIELD]
+            if not _is_valid_checksum_text(checksum):
+                fail(f"摘要格式错误（sha256 必须为 64 位小写十六进制字符串）: {normalized}")
+
         # 字面路径用于检查条目本身（lstat 不跟随末端符号链接）。
         data_file = data_dir.joinpath(*parts)
         # 解析路径用于越界检查（会跟随末端及父级符号链接）。
@@ -264,7 +309,15 @@ def _load_manifest(snapshot):
         if not stat.S_ISREG(fst.st_mode):
             fail(f"清单引用的数据不是普通文件: {normalized}")
 
-        entries.append((normalized, parts, data_file))
+        if checksum is not None:
+            try:
+                actual = _sha256_file(data_file)
+            except OSError as exc:
+                fail(f"无法读取文件以校验摘要: {normalized}: {exc}")
+            if actual != checksum:
+                fail(f"摘要校验不一致，数据字节已变化: {normalized}")
+
+        entries.append((normalized, parts, data_file, checksum))
 
     return snapshot_resolved, data_dir, entries
 
@@ -305,13 +358,13 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     # ---- 校验选择的路径确实列入清单（逐字精确匹配）----
     if selected:
         by_path = {normalized: (parts, data_file)
-                   for normalized, parts, data_file in entries}
+                   for normalized, parts, data_file, _checksum in entries}
         chosen = []
         for sel in selected:
             entry = by_path.get(sel)
             if entry is None:
                 fail(f"选择的路径未在快照清单中: {sel}")
-            chosen.append((sel, entry[0], entry[1]))
+            chosen.append((sel, entry[0], entry[1], None))
         entries = chosen
 
     # ---- 校验恢复目标路径 ----
@@ -322,7 +375,7 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
         fail("恢复目录不得位于快照目录内")
 
     # 解析后不得越出恢复目录。
-    for normalized, parts, _ in entries:
+    for normalized, parts, _data_file, _checksum in entries:
         _validate_within(dest_resolved, parts, "恢复目录", normalized)
 
     # ---- 所有预先可判定的检查通过后，才创建恢复目录 ----
@@ -330,7 +383,7 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     try:
         os.mkdir(dest)
         created = True
-        for normalized, parts, data_file in entries:
+        for normalized, parts, data_file, _checksum in entries:
             dst_file = dest_resolved.joinpath(*parts)
             os.makedirs(dst_file.parent, exist_ok=True)
             try:
@@ -359,6 +412,13 @@ def build_parser():
     )
     p_backup.add_argument("source")
     p_backup.add_argument("snapshot")
+    p_backup.add_argument(
+        "--checksum",
+        dest="checksum",
+        action="store_true",
+        help="在清单中记录每个文件原始字节的 SHA-256 摘要；"
+             "恢复时会校验带摘要的文件",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -382,7 +442,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "backup":
-        action = lambda: cmd_backup(args.source, args.snapshot)
+        action = lambda: cmd_backup(args.source, args.snapshot, args.checksum)
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     else:
