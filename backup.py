@@ -2,7 +2,7 @@
 """本地目录备份与恢复最小工具（快照版本 1）。
 
 用法:
-    python backup.py backup SOURCE SNAPSHOT
+    python backup.py backup SOURCE SNAPSHOT [--checksum]
     python backup.py restore SNAPSHOT DEST [--file PATH]...
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
@@ -17,6 +17,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -113,11 +114,48 @@ def _copy_bytes(src_path, dst_path):
             shutil.copyfileobj(src_f, dst_f, length=COPY_BUFFER_SIZE)
 
 
+def _copy_bytes_and_hash(src_path, dst_path):
+    """复制文件内容并返回内容的 SHA-256 摘要（64 位小写十六进制）。"""
+    digest = hashlib.sha256()
+    with open(src_path, "rb") as src_f:
+        with open(dst_path, "wb") as dst_f:
+            while True:
+                chunk = src_f.read(COPY_BUFFER_SIZE)
+                if not chunk:
+                    break
+                dst_f.write(chunk)
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _remove_tree(path):
     shutil.rmtree(path, ignore_errors=True)
 
 
-def cmd_backup(source_arg, snapshot_arg):
+def _validate_checksum_value(value, rel):
+    """校验清单条目里的 sha256 字段形态，合法则原样返回。"""
+    # 仅字段缺省表示无摘要；显式 null 同样属于格式错误。
+    if not isinstance(value, str) or len(value) != 64:
+        fail(f"摘要格式错误: {rel}")
+    for ch in value:
+        if ch not in "0123456789abcdef":
+            fail(f"摘要格式错误: {rel}")
+    return value
+
+
+def _sha256_of_file(path):
+    """计算普通文件字节的 SHA-256，返回 64 位小写十六进制字符串。"""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(COPY_BUFFER_SIZE)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cmd_backup(source_arg, snapshot_arg, checksum=False):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
 
@@ -154,19 +192,29 @@ def cmd_backup(source_arg, snapshot_arg):
         data_dir = snapshot / DATA_DIRNAME
         os.mkdir(data_dir)
 
+        checksums = {} if checksum else None
         for rel in rel_paths:
             parts = rel.split("/")
             src_file = source_resolved.joinpath(*parts)
             dst_file = data_dir.joinpath(*parts)
             os.makedirs(dst_file.parent, exist_ok=True)
             try:
-                _copy_bytes(src_file, dst_file)
+                if checksum:
+                    checksums[rel] = _copy_bytes_and_hash(src_file, dst_file)
+                else:
+                    _copy_bytes(src_file, dst_file)
             except OSError as exc:
                 fail(f"复制文件失败 {rel}: {exc}")
 
+        if checksum:
+            file_entries = [
+                {"path": rel, "sha256": checksums[rel]} for rel in rel_paths
+            ]
+        else:
+            file_entries = [{"path": rel} for rel in rel_paths]
         manifest = {
             "version": FORMAT_VERSION,
-            "files": [{"path": rel} for rel in rel_paths],
+            "files": file_entries,
         }
         manifest_tmp = snapshot / (MANIFEST_NAME + ".tmp")
         try:
@@ -264,6 +312,16 @@ def _load_manifest(snapshot):
         if not stat.S_ISREG(fst.st_mode):
             fail(f"清单引用的数据不是普通文件: {normalized}")
 
+        # 仅字段缺省表示无摘要；显式 null、类型/长度/字符不符均为格式错误。
+        if "sha256" in item:
+            expected = _validate_checksum_value(item["sha256"], normalized)
+            try:
+                actual = _sha256_of_file(data_file)
+            except OSError as exc:
+                fail(f"无法读取文件以校验摘要: {normalized}: {exc}")
+            if actual != expected:
+                fail(f"摘要校验不一致: {normalized}")
+
         entries.append((normalized, parts, data_file))
 
     return snapshot_resolved, data_dir, entries
@@ -359,6 +417,12 @@ def build_parser():
     )
     p_backup.add_argument("source")
     p_backup.add_argument("snapshot")
+    p_backup.add_argument(
+        "--checksum",
+        action="store_true",
+        help="为每个文件记录内容的 SHA-256 摘要；恢复时带摘要的文件"
+             "须与摘要一致才会恢复",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -382,7 +446,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "backup":
-        action = lambda: cmd_backup(args.source, args.snapshot)
+        action = lambda: cmd_backup(args.source, args.snapshot, args.checksum)
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     else:
