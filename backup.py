@@ -4,6 +4,7 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum]
     python backup.py restore SNAPSHOT DEST [--file PATH]...
+    python backup.py verify SNAPSHOT
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
@@ -235,7 +236,11 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False):
 
 
 def _load_manifest(snapshot):
-    """读取并严格校验快照清单，返回 (清单条目列表, data 真实路径)。"""
+    """读取并严格校验快照清单。
+
+    返回 (快照真实路径, data 真实路径, 条目列表)；每个条目为
+    (规范化相对路径, 路径分量, data 内路径, 是否带 sha256 摘要)。
+    """
     try:
         snap_st = os.lstat(snapshot)
     except OSError:
@@ -313,7 +318,8 @@ def _load_manifest(snapshot):
             fail(f"清单引用的数据不是普通文件: {normalized}")
 
         # 仅字段缺省表示无摘要；显式 null、类型/长度/字符不符均为格式错误。
-        if "sha256" in item:
+        has_checksum = "sha256" in item
+        if has_checksum:
             expected = _validate_checksum_value(item["sha256"], normalized)
             try:
                 actual = _sha256_of_file(data_file)
@@ -322,7 +328,7 @@ def _load_manifest(snapshot):
             if actual != expected:
                 fail(f"摘要校验不一致: {normalized}")
 
-        entries.append((normalized, parts, data_file))
+        entries.append((normalized, parts, data_file, has_checksum))
 
     return snapshot_resolved, data_dir, entries
 
@@ -359,6 +365,9 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     # ---- 读取并完整校验清单及其引用的数据（不创建任何目标）----
     # 清单校验始终针对整个快照，与是否选择子集无关。
     snapshot_resolved, _, entries = _load_manifest(snapshot)
+    # 恢复逻辑不区分条目是否带摘要，还原为三元组沿用原有处理。
+    entries = [(normalized, parts, data_file)
+               for normalized, parts, data_file, _ in entries]
 
     # ---- 校验选择的路径确实列入清单（逐字精确匹配）----
     if selected:
@@ -405,6 +414,26 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     return EXIT_OK
 
 
+def cmd_verify(snapshot_arg):
+    """只读校验整个快照清单，成功时向标准输出打印一个 JSON 对象。
+
+    不复制文件、不创建目录、不写任何报告；检查范围以清单引用为准，
+    data 中未被引用的文件不参与检查或计数。
+    """
+    snapshot = Path(snapshot_arg)
+    snapshot_resolved, _, entries = _load_manifest(snapshot)
+
+    verified = sum(1 for *_, has_checksum in entries if has_checksum)
+    result = {
+        "snapshot": str(snapshot_resolved),
+        "files": len(entries),
+        "verified": verified,
+        "unchecked": len(entries) - verified,
+    }
+    print(json.dumps(result, ensure_ascii=False))
+    return EXIT_OK
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="backup.py",
@@ -438,6 +467,11 @@ def build_parser():
              "缺省时恢复全部文件",
     )
 
+    p_verify = subparsers.add_parser(
+        "verify", help="只读校验快照清单及其引用的数据，不修改任何内容"
+    )
+    p_verify.add_argument("snapshot")
+
     return parser
 
 
@@ -449,9 +483,11 @@ def main(argv=None):
         action = lambda: cmd_backup(args.source, args.snapshot, args.checksum)
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
+    elif args.command == "verify":
+        action = lambda: cmd_verify(args.snapshot)
     else:
         parser.print_usage(sys.stderr)
-        print("错误: 必须指定 backup 或 restore 命令", file=sys.stderr)
+        print("错误: 必须指定 backup、restore 或 verify 命令", file=sys.stderr)
         return EXIT_ERROR
 
     try:
