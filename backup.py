@@ -3,7 +3,10 @@
 
 用法:
     python backup.py backup SOURCE SNAPSHOT
-    python backup.py restore SNAPSHOT DEST
+    python backup.py restore SNAPSHOT DEST [--file PATH]...
+
+--file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
+未提供 --file 时恢复清单中的全部文件。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -266,12 +269,50 @@ def _load_manifest(snapshot):
     return snapshot_resolved, data_dir, entries
 
 
-def cmd_restore(snapshot_arg, dest_arg):
+def _validate_file_selection(selections):
+    """校验 --file 选择值，返回按输入顺序去重后的列表；非法则失败。
+
+    选择值与清单 path 逐字精确匹配：仅拒绝绝对路径与空、.、.. 分量，
+    不做大小写转换、路径归一化、通配符匹配或目录展开。
+    """
+    seen = set()
+    selected = []
+    for sel in selections:
+        if sel == "":
+            fail("--file 选择不能为空字符串")
+        if sel.startswith("/"):
+            fail(f"--file 选择不能是绝对路径: {sel}")
+        for part in sel.split("/"):
+            if part in ("", ".", ".."):
+                fail(f"--file 选择包含无效路径分量: {sel}")
+        if sel not in seen:
+            seen.add(sel)
+            selected.append(sel)
+    return selected
+
+
+def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     snapshot = Path(snapshot_arg)
     dest = Path(dest_arg)
 
+    # ---- 校验 --file 选择值的形态（不创建任何目标）----
+    selected = _validate_file_selection(file_selections or [])
+
     # ---- 读取并完整校验清单及其引用的数据（不创建任何目标）----
+    # 清单校验始终针对整个快照，与是否选择子集无关。
     snapshot_resolved, _, entries = _load_manifest(snapshot)
+
+    # ---- 校验选择的路径确实列入清单（逐字精确匹配）----
+    if selected:
+        by_path = {normalized: (parts, data_file)
+                   for normalized, parts, data_file in entries}
+        chosen = []
+        for sel in selected:
+            entry = by_path.get(sel)
+            if entry is None:
+                fail(f"选择的路径未在快照清单中: {sel}")
+            chosen.append((sel, entry[0], entry[1]))
+        entries = chosen
 
     # ---- 校验恢复目标路径 ----
     if os.path.lexists(dest):
@@ -324,6 +365,14 @@ def build_parser():
     )
     p_restore.add_argument("snapshot")
     p_restore.add_argument("dest")
+    p_restore.add_argument(
+        "--file",
+        dest="files",
+        action="append",
+        metavar="PATH",
+        help="只恢复清单中该相对路径对应的文件，可重复指定；"
+             "缺省时恢复全部文件",
+    )
 
     return parser
 
@@ -335,7 +384,7 @@ def main(argv=None):
     if args.command == "backup":
         action = lambda: cmd_backup(args.source, args.snapshot)
     elif args.command == "restore":
-        action = lambda: cmd_restore(args.snapshot, args.dest)
+        action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     else:
         parser.print_usage(sys.stderr)
         print("错误: 必须指定 backup 或 restore 命令", file=sys.stderr)
