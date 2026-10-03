@@ -2,10 +2,12 @@
 """本地目录备份与恢复最小工具（快照版本 1）。
 
 用法:
-    python backup.py backup SOURCE SNAPSHOT [--checksum]
+    python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
     python backup.py restore SNAPSHOT DEST [--file PATH]...
     python backup.py verify SNAPSHOT
 
+--exclude 可重复指定，只影响本次备份：值以源目录为基准、以 / 分隔，
+与文件相对路径逐字匹配，不展开目录或通配符；缺省时备份全部文件。
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
 
@@ -156,9 +158,45 @@ def _sha256_of_file(path):
     return digest.hexdigest()
 
 
-def cmd_backup(source_arg, snapshot_arg, checksum=False):
+def _looks_like_drive_path(raw):
+    """识别 Windows 盘符形态（如 C:\\、C:/、C: 或盘符相对的 C:foo）。"""
+    return (
+        len(raw) >= 2
+        and raw[1] == ":"
+        and "a" <= raw[0].lower() <= "z"
+    )
+
+
+def _validate_exclude_paths(excludes):
+    """校验 --exclude 值的形态，返回按输入顺序去重后的列表；非法则失败。
+
+    值以源目录为基准、以 / 分隔，与文件相对路径逐字匹配：拒绝空字符串、
+    绝对路径、盘符路径、反斜杠以及空、.、.. 路径分量；不做大小写转换、
+    路径归一化、通配符匹配或目录展开。
+    """
+    seen = set()
+    valid = []
+    for raw in excludes:
+        if (
+            raw == ""
+            or "\\" in raw
+            or raw.startswith("/")
+            or _looks_like_drive_path(raw)
+            or any(part in ("", ".", "..") for part in raw.split("/"))
+        ):
+            fail(f"排除路径无效: {raw}")
+        if raw not in seen:
+            seen.add(raw)
+            valid.append(raw)
+    return valid
+
+
+def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
+
+    # ---- 校验 --exclude 值的形态（此时绝不创建任何目标）----
+    excludes = _validate_exclude_paths(excludes or [])
 
     # ---- 校验源目录（此时绝不创建任何目标）----
     try:
@@ -184,6 +222,15 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False):
 
     # ---- 完整遍历源目录，确认全部为普通文件/目录 ----
     rel_paths = _collect_source_files(source_resolved)
+
+    # ---- 应用排除项（逐字匹配普通文件，重复项只排除一次）----
+    included_set = set(rel_paths)
+    for raw in excludes:
+        if raw not in included_set:
+            fail(f"排除项未匹配普通文件: {raw}")
+    if excludes:
+        excluded_set = set(excludes)
+        rel_paths = [rel for rel in rel_paths if rel not in excluded_set]
 
     # ---- 所有预先可判定的检查通过后，才创建快照目录 ----
     created = False
@@ -446,6 +493,14 @@ def build_parser():
         help="为每个文件记录内容的 SHA-256 摘要；恢复时带摘要的文件"
              "须与摘要一致才会恢复",
     )
+    p_backup.add_argument(
+        "--exclude",
+        dest="excludes",
+        action="append",
+        metavar="PATH",
+        help="排除源目录中该相对路径（以 / 分隔）对应的普通文件，"
+             "逐字匹配、可重复指定，仅影响本次备份；缺省时备份全部文件",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -474,7 +529,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "backup":
-        action = lambda: cmd_backup(args.source, args.snapshot, args.checksum)
+        action = lambda: cmd_backup(
+            args.source, args.snapshot, args.checksum, args.excludes
+        )
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     elif args.command == "verify":
