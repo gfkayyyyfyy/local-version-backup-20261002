@@ -33,7 +33,8 @@
    被排除目录内也不报错。
 7. 非法形态：空字符串、绝对路径、带盘符路径、含反斜杠、含空/``.``/``..``
    分量，一律退出码 2，标准错误包含“排除目录路径无效”与原始参数。
-8. 形态合法但不存在或指向普通文件：退出码 2，标准错误包含
+8. 形态合法但不存在、指向普通文件、或任一分量仅大小写不同（含嵌套路径
+   与空目录，且不被已匹配的父目录掩盖）：退出码 2，标准错误包含
    “排除目录未匹配普通目录”与原始参数。
 9. 排除目录不绕过源目录安全检查：被排除目录内部含符号链接时仍按既有
    符号链接规则拒绝；快照已存在或位于源目录内仍按既有规则拒绝。
@@ -662,6 +663,51 @@ class BackupExcludeDirTests(unittest.TestCase):
         self.run_and_assert_rejected(
             ["Cache"], [REASON_UNMATCHED], "仅大小写不同",
         )
+
+    def test_reject_exclude_dir_case_different_nested(self):
+        """嵌套路径 cache/Sub：末级分量仅大小写不同，同样不匹配。"""
+        self.run_and_assert_rejected(
+            ["cache/Sub"], [REASON_UNMATCHED], "嵌套路径仅大小写不同",
+        )
+
+    def test_reject_exclude_dir_case_different_parent_component(self):
+        """嵌套路径 Cache/sub：中间分量仅大小写不同，同样不匹配。"""
+        self.run_and_assert_rejected(
+            ["Cache/sub"], [REASON_UNMATCHED], "中间分量仅大小写不同",
+        )
+
+    def test_reject_exclude_dir_case_different_covered_by_parent(self):
+        """cache 合法但 cache/Sub 拼错大小写：不因父目录已覆盖而忽略。"""
+        self.run_and_assert_rejected(
+            [CACHE_DIR_REL, "cache/Sub"], [REASON_UNMATCHED, "cache/Sub"],
+            "合法父目录不能掩盖拼错的子目录",
+        )
+
+    def test_reject_exclude_dir_case_different_empty_dir(self):
+        """空目录同样逐字匹配：Empty 存在时 empty 不匹配。"""
+        (self.source / "Empty").mkdir()
+        self.run_and_assert_rejected(
+            ["empty"], [REASON_UNMATCHED], "空目录仅大小写不同",
+        )
+
+    def test_exclude_empty_dir_verbatim_case_accepted(self):
+        """空目录按原样逐字匹配：Empty 合法排除，其余文件照常备份。"""
+        (self.source / "Empty").mkdir()
+        source_before = capture_tree(self.source)
+
+        proc = self.run_backup(["Empty"])
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        context = (
+            f"用例: 空目录逐字匹配\n"
+            f"exit={proc.returncode}\nstdout={stdout!r}\nstderr={stderr!r}"
+        )
+
+        self.assertEqual(proc.returncode, 0, f"退出码应为 0\n{context}")
+        self.assertEqual(stderr, "", f"成功时标准错误应为空\n{context}")
+        self.assertIn("已备份文件数: 2", stdout,
+                      f"排除空目录不影响文件计数\n{context}")
+        self.assert_source_unchanged(source_before, context)
 
     def test_reject_exclude_dir_glob_literal(self):
         """* 作为字面值：不做通配符展开，不匹配任何目录。"""

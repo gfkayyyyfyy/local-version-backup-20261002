@@ -179,6 +179,30 @@ def _validate_exclude_dirs(exclude_dirs):
     return selected
 
 
+def _match_exclude_dir(source_resolved, raw):
+    """判断排除目录值是否逐字匹配源目录中的真实普通目录。
+
+    逐分量对照父目录的真实条目名（os.listdir 返回文件系统记录的原名），
+    因此即使文件系统本身大小写不敏感、能用 Cache 打开 cache，仅大小写
+    不同的分量同样按未匹配处理；不转换大小写、不纠正目录名。
+    """
+    current = source_resolved
+    for part in raw.split("/"):
+        try:
+            names = os.listdir(current)
+        except OSError:
+            # 中间分量不是可读目录（例如指向普通文件），按未匹配处理。
+            return False
+        if part not in names:
+            return False
+        current = current / part
+    try:
+        st = os.lstat(current)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode)
+
+
 def _is_under_excluded_dir(rel, excluded_dir_set):
     """判断文件相对路径的任一祖先目录是否在被排除目录集合中。
 
@@ -287,17 +311,14 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
 
     # ---- 排除目录必须与源目录中真实存在的目录逐字匹配 ----
     # 源目录已经过完整安全检查（无符号链接、无非普通文件），此处 lstat 的
-    # 末端一定不是符号链接；不存在的路径与指向普通文件的路径一律拒绝，
-    # 存在的空目录同样是合法匹配。重复指定与父子目录重叠自然取并集。
+    # 末端一定不是符号链接；匹配按路径分量逐字对照真实目录条目名，大小写
+    # 不敏感的文件系统不会让仅大小写不同的值蒙混过关。不存在的路径与指向
+    # 普通文件的路径一律拒绝，存在的空目录同样是合法匹配。重复指定与父子
+    # 目录重叠自然取并集。
     if excluded_dirs:
         excluded_dir_set = set()
         for raw in excluded_dirs:
-            candidate = source_resolved.joinpath(*raw.split("/"))
-            try:
-                st = os.lstat(candidate)
-            except OSError:
-                fail(f"排除目录未匹配普通目录: {raw}")
-            if not stat.S_ISDIR(st.st_mode):
+            if not _match_exclude_dir(source_resolved, raw):
                 fail(f"排除目录未匹配普通目录: {raw}")
             excluded_dir_set.add(raw)
         rel_paths = [
