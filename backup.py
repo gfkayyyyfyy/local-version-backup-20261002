@@ -4,7 +4,7 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
     python backup.py restore SNAPSHOT DEST [--file PATH]...
-    python backup.py verify SNAPSHOT
+    python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
@@ -468,7 +468,7 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     return EXIT_OK
 
 
-def cmd_verify(snapshot_arg):
+def cmd_verify(snapshot_arg, details=False):
     """只读校验快照：完整检查清单及其引用的数据，不创建或修改任何内容。"""
     snapshot = Path(snapshot_arg)
 
@@ -482,6 +482,19 @@ def cmd_verify(snapshot_arg):
         "verified": verified,
         "unchecked": len(entries) - verified,
     }
+    if details:
+        # 逐文件明细：path 保留清单中的相对路径，按 Unicode 码点升序
+        # （Python 字符串默认比较即码点序），与清单顺序无关。
+        result["entries"] = sorted(
+            (
+                {
+                    "path": normalized,
+                    "status": "verified" if has_checksum else "unchecked",
+                }
+                for normalized, _, _, has_checksum in entries
+            ),
+            key=lambda item: item["path"],
+        )
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 
@@ -531,6 +544,12 @@ def build_parser():
         "verify", help="只读校验快照清单及其引用的数据，不恢复任何文件"
     )
     p_verify.add_argument("snapshot")
+    p_verify.add_argument(
+        "--details",
+        action="store_true",
+        help="校验成功时在结果 JSON 中附加 entries 逐文件明细"
+             "（path 与 status），按路径的 Unicode 码点升序排列",
+    )
 
     return parser
 
@@ -546,7 +565,7 @@ def main(argv=None):
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     elif args.command == "verify":
-        action = lambda: cmd_verify(args.snapshot)
+        action = lambda: cmd_verify(args.snapshot, args.details)
     else:
         parser.print_usage(sys.stderr)
         print("错误: 必须指定 backup、restore 或 verify 命令", file=sys.stderr)
