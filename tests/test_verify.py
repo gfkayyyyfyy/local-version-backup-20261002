@@ -33,6 +33,15 @@
    - 数据字节与合法摘要不一致：包含“摘要校验不一致”及对应相对路径。
    后三种样例中错误条目都显式排在一个有效条目之后，验证失败时不输出
    任何局部成功结果。
+   - 清单顶层 version 字段缺失，或为 null、true、false、字符串 "1"、
+     数值 1.0：包含“清单 version 字段类型不符”，且不得误报为
+     “不支持的清单版本”（布尔值与 1.0 虽与 1 相等，也不是受支持的
+     整数版本号）；
+   - version 为整数 0 或 2：包含“不支持的清单版本”及对应数值，
+     且不得误报为类型错误。
+   version 相关样例均从公开 backup 命令生成的有效无摘要版本 1 快照出发，
+   仅改动或移除顶层 version，其余清单字段与 data 字节保持原样；其正常
+   对照为前述无摘要旧快照成功用例（3/0/3）。
 3. 所有用例都比较 verify 前后的源目录与快照：相对路径集合、条目类型与
    普通文件字节一致，且整个临时工作区没有新增报告、恢复目录或其他文件
    （读取可能引起的访问时间变化不参与比较）。
@@ -75,6 +84,8 @@ REASON_JSON = "JSON"
 REASON_MISSING = "数据缺失"
 REASON_BAD_FORMAT = "摘要格式错误"
 REASON_MISMATCH = "摘要校验不一致"
+REASON_VERSION_TYPE = "清单 version 字段类型不符"
+REASON_VERSION_UNSUPPORTED = "不支持的清单版本"
 
 
 def run_cmd(argv):
@@ -441,6 +452,203 @@ class VerifyTests(unittest.TestCase):
 
         self.assert_verify_failure(
             snapshot, [REASON_MISMATCH, BIN_REL], "摘要校验不一致",
+        )
+
+    # ---- 失败：清单 version 字段类型不符 ----
+
+    def make_valid_no_checksum_snapshot(self, label):
+        """用公开 backup 命令生成有效的无摘要版本 1 快照作为版本用例起点。
+
+        只返回快照；调用方随后仅改动或移除清单顶层 version。
+        """
+        snapshot = self.make_snapshot(f"snap-version-{label}", checksum=False)
+        manifest = self.read_manifest(snapshot)
+        # 测试前提：起点是版本 1、三个无摘要条目的有效快照。
+        self.assertEqual(
+            manifest.get("version"), 1,
+            f"测试前提：{label} 起点清单版本应为 1",
+        )
+        self.assertIsInstance(manifest.get("version"), int)
+        self.assertNotIsInstance(manifest.get("version"), bool)
+        self.assertEqual(
+            [item["path"] for item in manifest["files"]],
+            sorted(BACKUP_FILES),
+            f"测试前提：{label} 起点清单应恰好包含三个相对路径",
+        )
+        self.assertTrue(
+            all("sha256" not in item for item in manifest["files"]),
+            f"测试前提：{label} 起点条目均不应带 sha256 字段",
+        )
+        return snapshot
+
+    def assert_verify_rejects_version(self, snapshot, tamper, reasons,
+                                       forbidden, label, value_desc):
+        """version 失败用例公共流程。
+
+        先用公开方式篡改顶层 version，再以“篡改完成之后”的目录树为基准
+        执行 verify：退出码 2、stdout 为空、stderr 含 reasons 中全部片段、
+        不含 forbidden 中任一片段，且源目录、快照、工作区与篡改后基准
+        完全一致（读取造成的访问时间变化不参与比较）。
+        """
+        manifest = self.read_manifest(snapshot)
+        tamper(manifest)
+        self.write_manifest(snapshot, manifest)
+
+        # 篡改后重新读取确认：清单仍是合法 JSON 且 files/data 未被波及，
+        # 保证拒绝原因只可能来自 version 字段本身。
+        after = self.read_manifest(snapshot)
+        self.assertEqual(
+            [item["path"] for item in after.get("files", [])],
+            sorted(BACKUP_FILES),
+            f"测试前提：{label} 篡改后 files 字段应保持原样\n输入: {value_desc}",
+        )
+        self.assertTrue(
+            all(set(item) == {"path"} for item in after["files"]),
+            f"测试前提：{label} 篡改后各条目应只有 path 字段\n输入: {value_desc}",
+        )
+
+        # 基准取自清单改动完成之后：此后的只读 verify 不得改动任何内容。
+        source_before = capture_tree(self.source)
+        snapshot_before = capture_tree(snapshot)
+        work_before = capture_tree(self.work)
+
+        proc = self.run_verify(snapshot)
+        stdout = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        context = (
+            f"用例: {label}\nversion 输入: {value_desc}\n"
+            f"快照 SNAPSHOT: {snapshot}\n"
+            f"exit={proc.returncode}\nstdout={stdout!r}\nstderr={stderr!r}"
+        )
+
+        self.assertEqual(proc.returncode, 2, f"退出码应为 2\n{context}")
+        self.assertEqual(stdout, "", f"拒绝后标准输出应为空\n{context}")
+        for reason in reasons:
+            self.assertIn(
+                reason, stderr,
+                f"标准错误缺少原因“{reason}”\n{context}",
+            )
+        for marker in forbidden:
+            self.assertNotIn(
+                marker, stderr,
+                f"该输入应按类型错误拒绝，标准错误不应出现"
+                f"“{marker}”\n{context}",
+            )
+
+        self.assert_work_intact(
+            source_before, snapshot_before, work_before, snapshot, context,
+        )
+
+    def test_verify_rejects_missing_version_field(self):
+        """仅移除顶层 version：类型不符（字段缺省不是整数 1）。"""
+        snapshot = self.make_valid_no_checksum_snapshot("missing")
+
+        def tamper(manifest):
+            del manifest["version"]
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            "version 字段缺失", "字段缺失（键不存在）",
+        )
+
+    def test_verify_rejects_null_version(self):
+        """version 显式为 null：类型不符，不等同于字段缺省或整数。"""
+        snapshot = self.make_valid_no_checksum_snapshot("null")
+
+        def tamper(manifest):
+            manifest["version"] = None
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            "version 为 null", "null",
+        )
+
+    def test_verify_rejects_true_version(self):
+        """version 为 true：布尔值虽等于整数 1，仍按类型不符拒绝。"""
+        snapshot = self.make_valid_no_checksum_snapshot("true")
+
+        def tamper(manifest):
+            manifest["version"] = True
+
+        # 陷阱前提：Python 中 True == 1 且 isinstance(True, int) 为真，
+        # 产品必须显式排除 bool，不能因数值相等就当作受支持的版本 1。
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            "version 为 true", "true（布尔值，Python 中 True == 1）",
+        )
+
+    def test_verify_rejects_false_version(self):
+        """version 为 false：布尔值按类型不符拒绝，不能走整数版本比较。"""
+        snapshot = self.make_valid_no_checksum_snapshot("false")
+
+        def tamper(manifest):
+            manifest["version"] = False
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            "version 为 false", "false（布尔值，Python 中 False == 0）",
+        )
+
+    def test_verify_rejects_string_one_version(self):
+        """version 为字符串 "1"：形态像版本号但类型不符。"""
+        snapshot = self.make_valid_no_checksum_snapshot("str1")
+
+        def tamper(manifest):
+            manifest["version"] = "1"
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            'version 为字符串 "1"', '"1"（字符串）',
+        )
+
+    def test_verify_rejects_float_one_version(self):
+        """version 为数值 1.0：与 1 相等但不是整数，按类型不符拒绝。"""
+        snapshot = self.make_valid_no_checksum_snapshot("float1")
+
+        def tamper(manifest):
+            manifest["version"] = 1.0
+
+        # 陷阱前提：Python 中 1.0 == 1 为真，产品不得以数值相等放行，
+        # 必须要求 version 是真正的整数类型。
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_TYPE], [REASON_VERSION_UNSUPPORTED],
+            "version 为数值 1.0", "1.0（浮点数，Python 中 1.0 == 1）",
+        )
+
+    # ---- 失败：不支持的整数版本 ----
+
+    def test_verify_rejects_integer_version_zero(self):
+        """version 为整数 0：类型合法但版本不受支持，stderr 含数值 0。"""
+        snapshot = self.make_valid_no_checksum_snapshot("int0")
+
+        def tamper(manifest):
+            manifest["version"] = 0
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_UNSUPPORTED, "0"],
+            [REASON_VERSION_TYPE],
+            "不支持的整数版本 0", "0（整数）",
+        )
+
+    def test_verify_rejects_integer_version_two(self):
+        """version 为整数 2：类型合法但版本不受支持，stderr 含数值 2。"""
+        snapshot = self.make_valid_no_checksum_snapshot("int2")
+
+        def tamper(manifest):
+            manifest["version"] = 2
+
+        self.assert_verify_rejects_version(
+            snapshot, tamper,
+            [REASON_VERSION_UNSUPPORTED, "2"],
+            [REASON_VERSION_TYPE],
+            "不支持的整数版本 2", "2（整数）",
         )
 
 
