@@ -4,7 +4,7 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
     python backup.py restore SNAPSHOT DEST [--file PATH]...
-    python backup.py verify SNAPSHOT
+    python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
@@ -12,6 +12,10 @@
 --exclude 可重复指定，只影响本次备份：以源目录为基准、使用 / 分隔的
 相对路径，与文件相对路径逐字匹配，匹配的普通文件不写入快照；
 未提供 --exclude 时备份源目录中的全部普通文件。
+
+--details 只影响 verify 成功时的输出：结果 JSON 中附加 entries 数组，
+逐项给出清单路径（/ 分隔，原样保留）与状态（verified/unchecked），
+按路径的 Unicode 码点升序排列；未提供 --details 时输出保持原样。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -468,7 +472,7 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     return EXIT_OK
 
 
-def cmd_verify(snapshot_arg):
+def cmd_verify(snapshot_arg, details=False):
     """只读校验快照：完整检查清单及其引用的数据，不创建或修改任何内容。"""
     snapshot = Path(snapshot_arg)
 
@@ -482,6 +486,19 @@ def cmd_verify(snapshot_arg):
         "verified": verified,
         "unchecked": len(entries) - verified,
     }
+    if details:
+        # 逐文件明细：path 保留清单中的原始相对路径，status 仅区分
+        # “摘要已核对一致”与“清单未提供摘要（内容完整性未验证）”。
+        # 按 path 的 Unicode 码点升序排列，与清单中的顺序无关。
+        result["entries"] = [
+            {
+                "path": normalized,
+                "status": "verified" if has_checksum else "unchecked",
+            }
+            for normalized, _, _, has_checksum in sorted(
+                entries, key=lambda entry: entry[0]
+            )
+        ]
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_OK
 
@@ -531,6 +548,12 @@ def build_parser():
         "verify", help="只读校验快照清单及其引用的数据，不恢复任何文件"
     )
     p_verify.add_argument("snapshot")
+    p_verify.add_argument(
+        "--details",
+        action="store_true",
+        help="校验成功时在结果 JSON 中附加 entries 逐文件明细数组；"
+             "缺省时输出与不含该选项的旧行为完全一致",
+    )
 
     return parser
 
@@ -546,7 +569,7 @@ def main(argv=None):
     elif args.command == "restore":
         action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
     elif args.command == "verify":
-        action = lambda: cmd_verify(args.snapshot)
+        action = lambda: cmd_verify(args.snapshot, args.details)
     else:
         parser.print_usage(sys.stderr)
         print("错误: 必须指定 backup、restore 或 verify 命令", file=sys.stderr)
