@@ -4,11 +4,15 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
                             [--exclude-dir PATH]... [--dry-run]
-    python backup.py restore SNAPSHOT DEST [--file PATH]... [--dry-run]
+    python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
+                            [--dry-run]
     python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
-未提供 --file 时恢复清单中的全部文件。
+--dir 可重复指定，恢复清单中位于该目录下的全部后代文件（按路径分量
+逐字匹配，保留大小写、中文与空格，不转换分隔符、不展开通配符）；
+两类选择取并集，重复目录、父子目录重叠及重复文件只恢复一次；
+--file 与 --dir 都未提供时恢复清单中的全部文件。
 
 --dry-run 只完成恢复前的全部校验并在标准输出打印一行 JSON 预览
 （snapshot、destination、files、paths），不创建目标目录、不复制文件；
@@ -511,12 +515,32 @@ def _validate_file_selection(selections):
     return selected
 
 
-def cmd_restore(snapshot_arg, dest_arg, file_selections=None, dry_run=False):
+def _validate_dir_selection(directories):
+    """校验 --dir 目录选择值的形态，返回按输入顺序去重后的列表。
+
+    形态规则与 --exclude 完全一致：仅拒绝空字符串、绝对路径、带盘符
+    路径、反斜杠以及空/./.. 路径分量；保留大小写、中文与空格，不做
+    分隔符转换、路径归一化或通配符展开。是否与清单匹配另行判定。
+    """
+    seen = set()
+    selected = []
+    for raw in directories:
+        if _exclude_form_invalid(raw):
+            fail(f"目录选择路径无效: {raw}")
+        if raw not in seen:
+            seen.add(raw)
+            selected.append(raw)
+    return selected
+
+
+def cmd_restore(snapshot_arg, dest_arg, file_selections=None,
+                dir_selections=None, dry_run=False):
     snapshot = Path(snapshot_arg)
     dest = Path(dest_arg)
 
-    # ---- 校验 --file 选择值的形态（不创建任何目标）----
+    # ---- 校验 --file / --dir 选择值的形态（不创建任何目标）----
     selected = _validate_file_selection(file_selections or [])
+    selected_dirs = _validate_dir_selection(dir_selections or [])
 
     # ---- 读取并完整校验清单及其引用的数据（不创建任何目标）----
     # 清单校验始终针对整个快照，与是否选择子集无关。
@@ -525,16 +549,32 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None, dry_run=False):
     entries = [(normalized, parts, data_file)
                for normalized, parts, data_file, _ in entries]
 
-    # ---- 校验选择的路径确实列入清单（逐字精确匹配）----
-    if selected:
+    # ---- 校验选择的路径确实列入清单，取 --file 与 --dir 的并集 ----
+    # 目录选择仅依据清单路径：清单条目以“目录前缀 + /”开头即为其后代，
+    # 按路径分量逐字匹配，不依赖源目录，也不纳入 data/ 中未列入清单的
+    # 文件。重复目录、父子目录重叠及与 --file 的重复只恢复一次。
+    if selected or selected_dirs:
         by_path = {normalized: (parts, data_file)
                    for normalized, parts, data_file in entries}
         chosen = []
+        seen = set()
         for sel in selected:
             entry = by_path.get(sel)
             if entry is None:
                 fail(f"选择的路径未在快照清单中: {sel}")
+            seen.add(sel)
             chosen.append((sel, entry[0], entry[1]))
+        for raw in selected_dirs:
+            prefix = raw + "/"
+            matched = False
+            for normalized, parts, data_file in entries:
+                if normalized.startswith(prefix):
+                    matched = True
+                    if normalized not in seen:
+                        seen.add(normalized)
+                        chosen.append((normalized, parts, data_file))
+            if not matched:
+                fail(f"选择的目录未包含快照清单文件: {raw}")
         entries = chosen
 
     # ---- 校验恢复目标路径 ----
@@ -671,7 +711,16 @@ def build_parser():
         action="append",
         metavar="PATH",
         help="只恢复清单中该相对路径对应的文件，可重复指定；"
-             "缺省时恢复全部文件",
+             "与 --dir 取并集，两者都缺省时恢复全部文件",
+    )
+    p_restore.add_argument(
+        "--dir",
+        dest="dirs",
+        action="append",
+        metavar="PATH",
+        help="恢复清单中位于该目录下的全部后代文件，可重复指定；"
+             "以 / 分隔的相对路径，按路径分量逐字匹配，"
+             "与 --file 取并集，两者都缺省时恢复全部文件",
     )
     p_restore.add_argument(
         "--dry-run",
@@ -707,7 +756,7 @@ def main(argv=None):
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(
-            args.snapshot, args.dest, args.files, args.dry_run
+            args.snapshot, args.dest, args.files, args.dirs, args.dry_run
         )
     elif args.command == "verify":
         action = lambda: cmd_verify(args.snapshot, args.details)

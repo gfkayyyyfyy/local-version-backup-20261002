@@ -14,10 +14,10 @@ python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]... [--excl
 python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]... [--exclude-dir PATH]... --dry-run
 
 # 恢复：将 SNAPSHOT 恢复到新建的 DEST 目录
-python backup.py restore SNAPSHOT DEST
+python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
 
 # 预览：只完成恢复前校验并打印本次计划，不创建 DEST、不复制文件
-python backup.py restore SNAPSHOT DEST [--file PATH]... --dry-run
+python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]... --dry-run
 ```
 
 成功时退出码为 0，标准输出打印新建目录的绝对路径与处理的文件数；
@@ -153,18 +153,42 @@ SNAPSHOT/
   校验时文件无法读取同样退出码 2。
 - 以上任一失败都不创建恢复目标、不打印成功摘要，也不改动源目录与快照。
 
+## 选择目录恢复（--dir）
+
+- `restore` 的 `--dir PATH` 可重复指定，恢复清单中位于该目录下的全部
+  后代文件，并保留它们相对于快照的完整路径；不传 `--dir` 且不传
+  `--file` 时仍恢复清单中的全部文件，行为与旧版完全一致。
+- `PATH` 以快照为基准、使用 `/` 分隔，按路径分量与清单 `path` **逐字**
+  匹配：保留大小写、中文与空格，不转换分隔符，不展开通配符。选择
+  `docs` 会包含 `docs/a.txt` 与 `docs/sub/b.bin`，不包含
+  `docs-old/a.txt` 或 `docs.txt`。
+- `--dir` 与 `--file` 可任意合用，所有选择取并集：重复目录、父子目录
+  重叠指定及与 `--file` 重复的文件只恢复一次。
+- 目录选择仅依据清单路径，不依赖源目录是否存在，也不把 `data/` 中
+  未列入清单的文件纳入结果。
+- 目录参数在创建恢复目标前校验，下列情况一律退出码 2、标准输出为空、
+  不创建恢复目标：
+  - 空字符串、以 `/` 开头、带 Windows 盘符、含反斜杠、或含空/`.`/`..`
+    路径分量：标准错误包含“目录选择路径无效”与原始参数；
+  - 形态合法但没有任何清单文件作为后代（包括清单未记录的空目录）：
+    标准错误包含“选择的目录未包含快照清单文件”与原始参数。
+- 任一目录不匹配即整体失败；与 `--file` 合用时，不存在的单文件仍按
+  原有拒绝结果整体失败。预览与实际恢复继续校验整个快照，未选中文件
+  的数据缺失或摘要不一致仍以退出码 2 结束、标准输出为空且不创建目标。
+
 ## 恢复预览（--dry-run）
 
 - `restore` 附加 `--dry-run` 时只执行与实际恢复完全相同的恢复前检查，
   随后在标准输出打印**一行** JSON 对象（末尾换行）并以退出码 0 结束，
-  标准错误为空。可与重复的 `--file` 同用；命令仍接收 SNAPSHOT 与 DEST。
+  标准错误为空。可与重复的 `--file`、`--dir` 同用；命令仍接收 SNAPSHOT
+  与 DEST。
 - JSON 对象仅含以下字段：
   - `snapshot`：解析后的快照目录绝对路径；
   - `destination`：解析后的目标绝对路径；
   - `files`：本次选择的文件数；
   - `paths`：本次选择的相对路径字符串数组，按 Unicode 码点升序排列，
     不受清单排列与 `--file` 参数顺序影响。
-- 不指定 `--file` 时选择清单中的全部文件；指定时继续逐字匹配相对路径，
+- 不指定 `--file` 与 `--dir` 时选择清单中的全部文件；指定时继续逐字匹配相对路径，
   保留大小写、中文与空格，重复选择只计一次，不展开目录或通配符。
   预览只展示清单内选中的文件，不纳入 `data/` 中的额外文件。空快照输出
   `files` 为 0、`paths` 为空数组。
