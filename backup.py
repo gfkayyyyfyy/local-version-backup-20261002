@@ -3,6 +3,7 @@
 
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
+        [--exclude-dir PATH]...
     python backup.py restore SNAPSHOT DEST [--file PATH]... [--dry-run]
     python backup.py verify SNAPSHOT [--details]
 
@@ -16,6 +17,10 @@ paths 为本次选择的相对路径，按 Unicode 码点升序排列。
 --exclude 可重复指定，只影响本次备份：以源目录为基准、使用 / 分隔的
 相对路径，与文件相对路径逐字匹配，匹配的普通文件不写入快照；
 未提供 --exclude 时备份源目录中的全部普通文件。
+
+--exclude-dir 可重复指定，只影响本次备份：以源目录为基准、使用 / 分隔的
+相对路径，与目录相对路径逐字匹配，匹配的目录及其全部后代文件不写入
+快照；重复指定或父子目录重叠时取并集，未提供时不排除任何目录。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -127,11 +132,25 @@ def _validate_exclusions(exclusions):
     仅拒绝空字符串、绝对路径、带盘符路径、反斜杠以及空/./.. 分量，
     不做大小写转换、分隔符转换、目录展开或通配符匹配。
     """
+    return _validate_path_args(exclusions, "排除路径无效")
+
+
+def _validate_exclude_dirs(exclude_dirs):
+    """校验 --exclude-dir 排除目录的形态，返回按输入顺序去重后的列表。
+
+    形态规则与 --exclude 完全相同；匹配语义（目录及其全部后代）在
+    收集源目录之后按相对路径逐字判定。
+    """
+    return _validate_path_args(exclude_dirs, "排除目录路径无效")
+
+
+def _validate_path_args(raw_paths, invalid_reason):
+    """校验相对路径参数形态并去重；非法时以 invalid_reason 失败。"""
     seen = set()
     selected = []
-    for raw in exclusions:
+    for raw in raw_paths:
         if _exclude_form_invalid(raw):
-            fail(f"排除路径无效: {raw}")
+            fail(f"{invalid_reason}: {raw}")
         if raw not in seen:
             seen.add(raw)
             selected.append(raw)
@@ -205,12 +224,14 @@ def _sha256_of_file(path):
     return digest.hexdigest()
 
 
-def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None):
+def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
+               exclude_dirs=None):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
 
-    # ---- 校验 --exclude 排除路径的形态（不创建任何目标）----
+    # ---- 校验 --exclude / --exclude-dir 参数的形态（不创建任何目标）----
     excluded = _validate_exclusions(excludes or [])
+    excluded_dirs = _validate_exclude_dirs(exclude_dirs or [])
 
     # ---- 校验源目录（此时绝不创建任何目标）----
     try:
@@ -239,13 +260,37 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None):
     rel_paths = _collect_source_files(source_resolved)
 
     # ---- 排除路径必须与收集到的普通文件逐字匹配（目录等一律不匹配）----
+    # 匹配针对完整源目录清单：即使该文件同时位于被排除目录内，仍按
+    # 普通文件匹配成功，不因目录排除而报错。
     if excluded:
         collected = set(rel_paths)
         for raw in excluded:
             if raw not in collected:
                 fail(f"排除项未匹配普通文件: {raw}")
+
+    # ---- 排除目录必须对应源目录中存在的普通目录（含空目录）----
+    # 此时完整遍历已通过，源目录内不存在符号链接，逐字拼接的相对路径
+    # 不会越出源目录；lstat 不跟随末端符号链接，普通文件等一律不匹配。
+    if excluded_dirs:
+        for raw in excluded_dirs:
+            candidate = source_resolved.joinpath(*raw.split("/"))
+            try:
+                st = os.lstat(candidate)
+            except OSError:
+                fail(f"排除目录未匹配普通目录: {raw}")
+            if not stat.S_ISDIR(st.st_mode):
+                fail(f"排除目录未匹配普通目录: {raw}")
+
+    # ---- 取并集过滤：精确匹配的普通文件 + 被排除目录的全部后代文件 ----
+    # 目录匹配以前缀“目录/”逐字判定，排除 cache 不影响 cache-old 或
+    # cache.txt；重复指定与父子目录重叠天然合并为同一份过滤结果。
+    if excluded or excluded_dirs:
         excluded_set = set(excluded)
-        rel_paths = [rel for rel in rel_paths if rel not in excluded_set]
+        dir_prefixes = tuple(f"{raw}/" for raw in excluded_dirs)
+        rel_paths = [
+            rel for rel in rel_paths
+            if rel not in excluded_set and not rel.startswith(dir_prefixes)
+        ]
 
     # ---- 所有预先可判定的检查通过后，才创建快照目录 ----
     created = False
@@ -543,6 +588,15 @@ def build_parser():
         help="本次备份排除该相对路径对应的普通文件，可重复指定；"
              "与源目录中的文件相对路径逐字匹配，缺省时备份全部文件",
     )
+    p_backup.add_argument(
+        "--exclude-dir",
+        dest="exclude_dirs",
+        action="append",
+        metavar="PATH",
+        help="本次备份排除该相对目录及其全部后代文件，可重复指定；"
+             "与源目录中的目录相对路径逐字匹配，重复或重叠时取并集，"
+             "缺省时不排除任何目录",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -586,7 +640,8 @@ def main(argv=None):
 
     if args.command == "backup":
         action = lambda: cmd_backup(
-            args.source, args.snapshot, args.checksum, args.excludes
+            args.source, args.snapshot, args.checksum, args.excludes,
+            args.exclude_dirs,
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(
