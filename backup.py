@@ -4,11 +4,14 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
                             [--exclude-dir PATH]... [--dry-run]
-    python backup.py restore SNAPSHOT DEST [--file PATH]... [--dry-run]
+    python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
+                            [--dry-run]
     python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
-未提供 --file 时恢复清单中的全部文件。
+--dir 可重复指定，恢复清单中位于该目录下的全部后代文件（按路径
+分量逐字前缀匹配，保留相对快照的完整路径）；两类选择取并集、
+重复选择只恢复一次；均未提供时恢复清单中的全部文件。
 
 --dry-run 只完成恢复前的全部校验并在标准输出打印一行 JSON 预览
 （snapshot、destination、files、paths），不创建目标目录、不复制文件；
@@ -511,12 +514,47 @@ def _validate_file_selection(selections):
     return selected
 
 
-def cmd_restore(snapshot_arg, dest_arg, file_selections=None, dry_run=False):
+def _validate_dir_selections(selections):
+    """校验 --dir 选择值，返回按输入顺序去重后的列表；非法则失败。
+
+    目录选择以快照清单路径为基准、使用 / 分隔，按路径分量逐字匹配：
+    拒绝空字符串、以 / 开头、带 Windows 盘符、含反斜杠，以及空/./..
+    分量；不做大小写转换、分隔符转换、通配符展开或目录展开。是否收录
+    清单文件在读取清单后另行判定，不依赖源目录或数据目录中是否存在
+    对应目录。
+    """
+    seen = set()
+    selected = []
+    for sel in selections:
+        if _exclude_form_invalid(sel):
+            fail(f"目录选择路径无效: {sel}")
+        if sel not in seen:
+            seen.add(sel)
+            selected.append(sel)
+    return selected
+
+
+def _is_under_selected_dir(rel, dir_parts):
+    """判断清单相对路径 rel 是否为目录 dir_paths 的逐字后代。
+
+    按路径分量逐级前缀比对：选择 docs 收录 docs/a.txt 与 docs/sub/b.bin，
+    但不收录 docs-old/a.txt 或 docs.txt；rel 与目录同形（清单文件恰好
+    名为 docs）也不算后代。
+    """
+    parts = rel.split("/")
+    if len(parts) <= len(dir_parts):
+        return False
+    return parts[:len(dir_parts)] == dir_parts
+
+
+def cmd_restore(snapshot_arg, dest_arg, file_selections=None,
+                dir_selections=None, dry_run=False):
     snapshot = Path(snapshot_arg)
     dest = Path(dest_arg)
 
-    # ---- 校验 --file 选择值的形态（不创建任何目标）----
-    selected = _validate_file_selection(file_selections or [])
+    # ---- 校验 --file / --dir 选择值的形态（不创建任何目标）----
+    selected_files = _validate_file_selection(file_selections or [])
+    selected_dirs = _validate_dir_selections(dir_selections or [])
 
     # ---- 读取并完整校验清单及其引用的数据（不创建任何目标）----
     # 清单校验始终针对整个快照，与是否选择子集无关。
@@ -525,17 +563,35 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None, dry_run=False):
     entries = [(normalized, parts, data_file)
                for normalized, parts, data_file, _ in entries]
 
-    # ---- 校验选择的路径确实列入清单（逐字精确匹配）----
-    if selected:
+    # ---- 依据清单路径确定选择集合（--file 与 --dir 取并集、去重）----
+    # 目录选择只依据清单路径：不依赖源目录存在，也不纳入 data/ 中未列入
+    # 清单的文件。任一单文件或目录不匹配都整体失败，不创建恢复目标。
+    if selected_files or selected_dirs:
         by_path = {normalized: (parts, data_file)
                    for normalized, parts, data_file in entries}
-        chosen = []
-        for sel in selected:
+        chosen = {}
+
+        for sel in selected_files:
             entry = by_path.get(sel)
             if entry is None:
                 fail(f"选择的路径未在快照清单中: {sel}")
-            chosen.append((sel, entry[0], entry[1]))
-        entries = chosen
+            chosen[sel] = entry
+
+        for sel in selected_dirs:
+            dir_parts = sel.split("/")
+            descendants = [
+                normalized for normalized, _, _ in entries
+                if _is_under_selected_dir(normalized, dir_parts)
+            ]
+            if not descendants:
+                fail(f"选择的目录未包含快照清单文件: {sel}")
+            for normalized in descendants:
+                chosen[normalized] = by_path[normalized]
+
+        entries = [
+            (normalized, entry[0], entry[1])
+            for normalized, entry in chosen.items()
+        ]
 
     # ---- 校验恢复目标路径 ----
     if os.path.lexists(dest):
@@ -674,6 +730,16 @@ def build_parser():
              "缺省时恢复全部文件",
     )
     p_restore.add_argument(
+        "--dir",
+        dest="dirs",
+        action="append",
+        metavar="PATH",
+        help="只恢复清单中位于该相对目录下的全部后代文件，可重复指定；"
+             "按路径分量逐字匹配（选择 docs 不影响 docs-old 或 docs.txt），"
+             "保留相对快照的完整路径；与 --file 取并集，重复目录或父子"
+             "目录重叠只恢复一次，缺省时不按目录筛选",
+    )
+    p_restore.add_argument(
         "--dry-run",
         dest="dry_run",
         action="store_true",
@@ -707,7 +773,7 @@ def main(argv=None):
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(
-            args.snapshot, args.dest, args.files, args.dry_run
+            args.snapshot, args.dest, args.files, args.dirs, args.dry_run
         )
     elif args.command == "verify":
         action = lambda: cmd_verify(args.snapshot, args.details)
