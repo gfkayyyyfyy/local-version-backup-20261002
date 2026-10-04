@@ -95,8 +95,14 @@ def _validate_within(base_resolved, parts, label, raw):
 
 
 def _collect_source_files(source):
-    """递归收集源目录中的普通文件，返回使用斜杠分隔的相对路径列表。"""
+    """递归遍历源目录，返回 (普通文件相对路径列表, 普通目录相对路径列表)。
+
+    两类路径都使用斜杠分隔；目录路径不含末尾斜杠，空目录同样收集。
+    名称直接取自 os.scandir 的逐字结果，因此在大小写不敏感的文件系统上
+    仍保留磁盘上的真实大小写，不被路径解析时的大小写折叠影响。
+    """
     collected = []
+    collected_dirs = []
 
     def scan(dir_path, rel_prefix):
         try:
@@ -114,6 +120,7 @@ def _collect_source_files(source):
                 fail(f"无法读取源条目 {rel}: {exc}")
             mode = st.st_mode
             if stat.S_ISDIR(mode):
+                collected_dirs.append(rel)
                 scan(entry.path, rel + "/")
             elif stat.S_ISREG(mode):
                 collected.append(rel)
@@ -122,7 +129,8 @@ def _collect_source_files(source):
 
     scan(str(source), "")
     collected.sort()
-    return collected
+    collected_dirs.sort()
+    return collected, collected_dirs
 
 
 def _validate_exclusions(exclusions):
@@ -272,7 +280,7 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
 
     # ---- 完整遍历源目录，确认全部为普通文件/目录 ----
     # 排除参数不绕过此处的完整安全检查：符号链接与非普通文件仍整体拒绝。
-    rel_paths = _collect_source_files(source_resolved)
+    rel_paths, rel_dirs = _collect_source_files(source_resolved)
 
     # ---- 排除路径必须与收集到的普通文件逐字匹配（目录等一律不匹配）----
     # 单文件排除始终按完整源目录判断：即使该文件同时位于被排除目录内，
@@ -285,19 +293,19 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
         excluded_set = set(excluded)
         rel_paths = [rel for rel in rel_paths if rel not in excluded_set]
 
-    # ---- 排除目录必须与源目录中真实存在的目录逐字匹配 ----
-    # 源目录已经过完整安全检查（无符号链接、无非普通文件），此处 lstat 的
-    # 末端一定不是符号链接；不存在的路径与指向普通文件的路径一律拒绝，
-    # 存在的空目录同样是合法匹配。重复指定与父子目录重叠自然取并集。
+    # ---- 排除目录必须与源目录中真实目录的完整相对路径逐字匹配 ----
+    # 名称取自遍历 scandir 的逐字结果而非路径解析：在大小写不敏感的文件
+    # 系统上 Cache 可能打开 cache，但逐字集合中没有 Cache，仍按未匹配拒绝，
+    # 使大小写敏感与不敏感文件系统遵守同一规则。源目录已经过完整安全检查
+    # （无符号链接、无非普通文件）；不存在的路径、指向普通文件的路径以及
+    # 仅大小写不同的路径一律拒绝，存在的空目录同样在集合中、是合法匹配。
+    # 每个值独立校验：即使另一值是已覆盖该路径的合法父目录，拼错的子目录
+    # 值仍按未匹配拒绝；重复指定与父子目录重叠在合法值之间自然取并集。
     if excluded_dirs:
+        real_dir_set = set(rel_dirs)
         excluded_dir_set = set()
         for raw in excluded_dirs:
-            candidate = source_resolved.joinpath(*raw.split("/"))
-            try:
-                st = os.lstat(candidate)
-            except OSError:
-                fail(f"排除目录未匹配普通目录: {raw}")
-            if not stat.S_ISDIR(st.st_mode):
+            if raw not in real_dir_set:
                 fail(f"排除目录未匹配普通目录: {raw}")
             excluded_dir_set.add(raw)
         rel_paths = [
