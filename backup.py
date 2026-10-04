@@ -60,6 +60,10 @@ def _split_relpath(rel):
     """校验并拆分清单中的相对路径，返回路径分量；非法则失败。"""
     if not isinstance(rel, str) or rel == "":
         fail("清单中的路径必须是非空字符串")
+    if "\x00" in rel:
+        # 以 JSON 字符串形式展示原始路径：空字符呈现为字面转义序列
+        # \u0000，不向标准错误输出实际空字符。
+        fail(f"清单路径包含空字符: {json.dumps(rel, ensure_ascii=False)}")
     if rel.startswith("/"):
         fail(f"清单包含绝对路径: {rel}")
     parts = rel.split("/")
