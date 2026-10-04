@@ -3,11 +3,16 @@
 
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
-    python backup.py restore SNAPSHOT DEST [--file PATH]...
+    python backup.py restore SNAPSHOT DEST [--file PATH]... [--dry-run]
     python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
+
+--dry-run 只预览本次准备恢复的文件：沿用实际恢复的全部校验，
+但不创建目标目录、不复制任何文件；校验通过时向标准输出打印
+一行 JSON（snapshot、destination、files、paths）并以退出码 0
+结束。
 
 --exclude 可重复指定，只影响本次备份：以源目录为基准、使用 / 分隔的
 相对路径，与文件相对路径逐字匹配，匹配的普通文件不写入快照；
@@ -409,7 +414,7 @@ def _validate_file_selection(selections):
     return selected
 
 
-def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
+def cmd_restore(snapshot_arg, dest_arg, file_selections=None, dry_run=False):
     snapshot = Path(snapshot_arg)
     dest = Path(dest_arg)
 
@@ -445,6 +450,19 @@ def cmd_restore(snapshot_arg, dest_arg, file_selections=None):
     # 解析后不得越出恢复目录。
     for normalized, parts, _ in entries:
         _validate_within(dest_resolved, parts, "恢复目录", normalized)
+
+    # ---- 预览模式：全部校验通过后只输出计划，不创建或修改任何内容 ----
+    if dry_run:
+        # paths 按 Unicode 码点升序（Python 字符串默认比较即码点序），
+        # 与清单排列和 --file 参数顺序无关。
+        plan = {
+            "snapshot": str(snapshot_resolved),
+            "destination": str(dest_resolved),
+            "files": len(entries),
+            "paths": sorted(normalized for normalized, _, _ in entries),
+        }
+        print(json.dumps(plan, ensure_ascii=False))
+        return EXIT_OK
 
     # ---- 所有预先可判定的检查通过后，才创建恢复目录 ----
     created = False
@@ -539,6 +557,14 @@ def build_parser():
         help="只恢复清单中该相对路径对应的文件，可重复指定；"
              "缺省时恢复全部文件",
     )
+    p_restore.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="只预览本次准备恢复的文件：完成与实际恢复相同的校验后，"
+             "向标准输出打印一行 JSON（snapshot、destination、files、"
+             "paths），不创建目标目录也不复制任何文件",
+    )
 
     p_verify = subparsers.add_parser(
         "verify", help="只读校验快照清单及其引用的数据，不恢复任何文件"
@@ -563,7 +589,9 @@ def main(argv=None):
             args.source, args.snapshot, args.checksum, args.excludes
         )
     elif args.command == "restore":
-        action = lambda: cmd_restore(args.snapshot, args.dest, args.files)
+        action = lambda: cmd_restore(
+            args.snapshot, args.dest, args.files, args.dry_run
+        )
     elif args.command == "verify":
         action = lambda: cmd_verify(args.snapshot, args.details)
     else:
