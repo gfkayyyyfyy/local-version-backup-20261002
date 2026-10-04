@@ -3,12 +3,17 @@
 
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
-                            [--exclude-dir PATH]...
+                            [--exclude-dir PATH]... [--dry-run]
     python backup.py restore SNAPSHOT DEST [--file PATH]... [--dry-run]
     python backup.py verify SNAPSHOT [--details]
 
 --file 可重复指定，只从快照恢复清单中逐字匹配的相对路径；
 未提供 --file 时恢复清单中的全部文件。
+
+backup --dry-run 只完成备份前的全部校验并在标准输出打印一行 JSON 预览
+（source、snapshot、files、paths），不创建快照目录及其父目录、不复制
+文件、不生成清单或临时文件；paths 为本次收录的相对路径，按 Unicode
+码点升序排列；--checksum 在预览中不计算摘要、不读取文件内容。
 
 --dry-run 只完成恢复前的全部校验并在标准输出打印一行 JSON 预览
 （snapshot、destination、files、paths），不创建目标目录、不复制文件；
@@ -264,7 +269,7 @@ def _sha256_of_file(path):
 
 
 def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
-               exclude_dirs=None):
+               exclude_dirs=None, dry_run=False):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
 
@@ -325,6 +330,20 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
             rel for rel in rel_paths
             if not _is_under_excluded_dir(rel, excluded_dir_set)
         ]
+
+    # ---- 预览：只输出本次收录计划，不创建任何目录、文件或临时产物 ----
+    # 此时备份前的全部校验（含排除区域的源目录安全检查）均已通过；
+    # 不计算摘要、不读取文件内容、不探测写入权限，预览成功不承诺随后的
+    # 实际复制一定成功。
+    if dry_run:
+        preview = {
+            "source": str(source_resolved),
+            "snapshot": str(snapshot_resolved),
+            "files": len(rel_paths),
+            "paths": rel_paths,
+        }
+        print(json.dumps(preview, ensure_ascii=False))
+        return EXIT_OK
 
     # ---- 所有预先可判定的检查通过后，才创建快照目录 ----
     created = False
@@ -631,6 +650,15 @@ def build_parser():
              "可重复指定；与源目录中的目录相对路径逐字匹配，"
              "重复指定或父子目录重叠时取并集，缺省时不排除任何目录",
     )
+    p_backup.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        help="只执行备份前的全部校验并在标准输出打印一行 JSON 预览"
+             "（source、snapshot、files、paths），不创建快照目录及其父"
+             "目录、不复制或修改任何文件、不生成清单或临时文件；"
+             "paths 按 Unicode 码点升序排列",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -675,7 +703,7 @@ def main(argv=None):
     if args.command == "backup":
         action = lambda: cmd_backup(
             args.source, args.snapshot, args.checksum, args.excludes,
-            args.exclude_dirs,
+            args.exclude_dirs, args.dry_run,
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(
