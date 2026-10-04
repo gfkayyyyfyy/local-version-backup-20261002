@@ -30,9 +30,14 @@
    - 清单 JSON 损坏：标准错误包含“JSON”；
    - 清单引用的数据缺失：包含“数据缺失”及对应相对路径；
    - sha256 显式为 null：包含“摘要格式错误”及对应相对路径；
-   - 数据字节与合法摘要不一致：包含“摘要校验不一致”及对应相对路径。
-   后三种样例中错误条目都显式排在一个有效条目之后，验证失败时不输出
-   任何局部成功结果。
+   - 数据字节与合法摘要不一致：包含“摘要校验不一致”及对应相对路径；
+   - 顶层 version 字段缺失，或为 null、true、false、字符串“1”、数值 1.0：
+     包含“清单 version 字段类型不符”（布尔值虽是 int 子类、1.0 与 1
+     数值相等，也不得被当作受支持版本）；
+   - 顶层 version 为整数 0 或 2：包含“不支持的清单版本”及对应数值，
+     与类型错误明确区分。
+   后三种 sha256/数据样例中错误条目都显式排在一个有效条目之后，
+   验证失败时不输出任何局部成功结果。
 3. 所有用例都比较 verify 前后的源目录与快照：相对路径集合、条目类型与
    普通文件字节一致，且整个临时工作区没有新增报告、恢复目录或其他文件
    （读取可能引起的访问时间变化不参与比较）。
@@ -75,6 +80,8 @@ REASON_JSON = "JSON"
 REASON_MISSING = "数据缺失"
 REASON_BAD_FORMAT = "摘要格式错误"
 REASON_MISMATCH = "摘要校验不一致"
+REASON_VERSION_TYPE = "清单 version 字段类型不符"
+REASON_VERSION_UNSUPPORTED = "不支持的清单版本"
 
 
 def run_cmd(argv):
@@ -190,6 +197,68 @@ class VerifyTests(unittest.TestCase):
         ]
         manifest["files"] = [by_path[first_rel], by_path[bad_rel], *rest]
         self.write_manifest(snapshot, manifest)
+
+    # version 输入用 (标签, 裸 JSON 标量文本) 描述：直接写入裸文本而非经
+    # json.dumps，才能精确表达 null/true/false 等 JSON 标量类型，并区分
+    # 字符串 "1" 与数值 1.0；字段缺失单独用 None 表示。
+    VERSION_TYPE_CASES = [
+        ("字段缺失", None),
+        ("null", "null"),
+        ("true", "true"),
+        ("false", "false"),
+        ('字符串"1"', '"1"'),
+        ("数值1.0", "1.0"),
+    ]
+    # 整数版本用 (标签, 裸 JSON 文本, 报错中应出现的数值) 描述。
+    VERSION_UNSUPPORTED_CASES = [("整数0", "0", 0), ("整数2", "2", 2)]
+
+    # 占位串只可能出现在刚写入的 version 值中（fixture 路径与摘要均不含此
+    # 串），带引号整体替换后得到精确的目标标量文本，其余字符保持规范格式。
+    VERSION_PLACEHOLDER = "__verify_test_version_placeholder__"
+
+    def replace_version(self, snapshot, token):
+        """只改动清单顶层 version：token 为 None 时移除该字段，否则将其
+        替换为该裸 JSON 标量文本；files 等其余字段与 data 下的数据文件原样
+        保留。基线快照由公开 backup 命令生成，version 必为整数 1，以此保证
+        每个用例只引入 version 这一处问题。
+        """
+        manifest_path = snapshot / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version = manifest.get("version")
+        self.assertEqual(
+            version, 1,
+            "测试前提：公开 backup 生成的清单 version 应为整数 1",
+        )
+        self.assertIs(type(version), int)
+        self.assertNotIsInstance(version, bool)
+        files_before = manifest["files"]
+        keys_before = set(manifest)
+
+        if token is None:
+            del manifest["version"]
+            rendered = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        else:
+            manifest["version"] = self.VERSION_PLACEHOLDER
+            quoted = json.dumps(self.VERSION_PLACEHOLDER, ensure_ascii=False)
+            rendered_obj = json.dumps(manifest, ensure_ascii=False, indent=2)
+            # 占位串只允许出现在 version 值这一处。
+            self.assertEqual(
+                rendered_obj.count(quoted), 1,
+                "测试前提：version 占位串应只出现一次",
+            )
+            rendered = rendered_obj.replace(quoted, token) + "\n"
+        manifest_path.write_text(rendered, encoding="utf-8")
+
+        # 回读确认：清单仍是合法 JSON，且除 version 外的字段逐字未变。
+        rewritten = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            rewritten["files"], files_before,
+            "测试前提：改动 version 不得影响 files 条目",
+        )
+        self.assertEqual(
+            set(rewritten) - {"version"}, keys_before - {"version"},
+            "测试前提：改动 version 不得增删其他顶层字段",
+        )
 
     def run_verify(self, snapshot):
         """以公开入口执行 verify。"""
@@ -442,6 +511,63 @@ class VerifyTests(unittest.TestCase):
         self.assert_verify_failure(
             snapshot, [REASON_MISMATCH, BIN_REL], "摘要校验不一致",
         )
+
+    # ---- 失败：清单 version 字段类型不符 ----
+
+    def test_verify_rejects_wrong_version_types(self):
+        """version 缺失或为 null、true、false、字符串“1”、数值 1.0：均属
+        类型错误而非版本不支持。布尔值虽是 int 子类、1.0 与 1 数值相等，
+        也不得被当作受支持的版本 1。每个输入退出码 2、stdout 为空、
+        stderr 含“清单 version 字段类型不符”且不含“不支持的清单版本”，
+        并且 verify 前后源目录、快照与整个工作区逐字一致。"""
+        for index, (desc, token) in enumerate(self.VERSION_TYPE_CASES):
+            with self.subTest(version=desc):
+                # 每个输入使用独立快照，互不影响；基线为公开 backup 生成的
+                # 有效无摘要版本 1 快照，随后只改动顶层 version 这一处。
+                snapshot = self.make_snapshot(
+                    f"snap-vtype-{index}", checksum=False,
+                )
+                self.replace_version(snapshot, token)
+
+                _, stderr, _ = self.assert_verify_failure(
+                    snapshot,
+                    [REASON_VERSION_TYPE],
+                    f"version {desc}（类型错误）",
+                )
+                # 必须与“不支持的整数版本”区分，不能只断言命令失败。
+                self.assertNotIn(
+                    REASON_VERSION_UNSUPPORTED, stderr,
+                    f"version {desc} 应报类型错误，而非版本不支持\n"
+                    f"stderr={stderr!r}",
+                )
+
+    # ---- 失败：不支持的整数清单版本 ----
+
+    def test_verify_rejects_unsupported_integer_versions(self):
+        """version 为整数 0 或 2：类型合法但版本不受支持，退出码 2、
+        stdout 为空、stderr 同时含“不支持的清单版本”与该数值，且不含
+        “清单 version 字段类型不符”；verify 前后文件状态逐字一致。"""
+        for index, (desc, token, number) in enumerate(
+            self.VERSION_UNSUPPORTED_CASES
+        ):
+            with self.subTest(version=desc):
+                snapshot = self.make_snapshot(
+                    f"snap-vnum-{index}", checksum=False,
+                )
+                self.replace_version(snapshot, token)
+
+                # 完整片段精确绑定报错中的数值，避免 “0”/“2” 误匹配其他
+                # 文本，也比单纯断言命令失败更严格。
+                _, stderr, _ = self.assert_verify_failure(
+                    snapshot,
+                    [f"不支持的清单版本: {number}"],
+                    f"version {desc}（不支持的版本）",
+                )
+                self.assertNotIn(
+                    REASON_VERSION_TYPE, stderr,
+                    f"整数 version {desc} 应报版本不支持，而非类型错误\n"
+                    f"stderr={stderr!r}",
+                )
 
 
 if __name__ == "__main__":
