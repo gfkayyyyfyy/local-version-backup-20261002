@@ -134,24 +134,6 @@ def _collect_source_files(source):
     return collected
 
 
-def _validate_exclusions(exclusions):
-    """校验 --exclude 排除路径的形态，返回按输入顺序去重后的列表。
-
-    排除路径以源目录为基准、使用 / 分隔，与文件相对路径逐字精确匹配：
-    仅拒绝空字符串、绝对路径、带盘符路径、反斜杠以及空/./.. 分量，
-    不做大小写转换、分隔符转换、目录展开或通配符匹配。
-    """
-    seen = set()
-    selected = []
-    for raw in exclusions:
-        if _exclude_form_invalid(raw):
-            fail(f"排除路径无效: {raw}")
-        if raw not in seen:
-            seen.add(raw)
-            selected.append(raw)
-    return selected
-
-
 def _exclude_form_invalid(raw):
     """判断 --exclude / --exclude-dir 参数形态是否非法（非法返回 True）。"""
     if raw == "":
@@ -171,21 +153,39 @@ def _exclude_form_invalid(raw):
     return False
 
 
-def _validate_exclude_dirs(exclude_dirs):
-    """校验 --exclude-dir 排除目录路径的形态，返回按输入顺序去重后的列表。
+def _validate_exclusion_paths(values, invalid_reason):
+    """校验一类排除参数的形态并去重，返回按输入顺序去重后的列表。
 
-    形态规则与 --exclude 完全一致：仅拒绝空字符串、绝对路径、带盘符路径、
-    反斜杠以及空/./.. 分量；是否匹配真实目录在遍历源目录后另行判定。
+    --exclude 与 --exclude-dir 共用同一套形态规则：仅拒绝空字符串、
+    绝对路径、带盘符路径、反斜杠以及空/./.. 分量，不做大小写转换、
+    分隔符转换、目录展开或通配符匹配；同类多个非法值按输入顺序报告
+    首项。是否与真实文件/目录匹配在遍历源目录后另行判定。
     """
     seen = set()
     selected = []
-    for raw in exclude_dirs:
+    for raw in values:
         if _exclude_form_invalid(raw):
-            fail(f"排除目录路径无效: {raw}")
+            fail(f"{invalid_reason}: {raw}")
         if raw not in seen:
             seen.add(raw)
             selected.append(raw)
     return selected
+
+
+def _validate_exclusions(exclusions):
+    """校验 --exclude 排除路径的形态，返回按输入顺序去重后的列表。
+
+    排除路径以源目录为基准、使用 / 分隔，与文件相对路径逐字精确匹配。
+    """
+    return _validate_exclusion_paths(exclusions, "排除路径无效")
+
+
+def _validate_exclude_dirs(exclude_dirs):
+    """校验 --exclude-dir 排除目录路径的形态，返回按输入顺序去重后的列表。
+
+    形态规则与 --exclude 完全一致；是否匹配真实目录另行判定。
+    """
+    return _validate_exclusion_paths(exclude_dirs, "排除目录路径无效")
 
 
 def _match_exclude_dir(source_resolved, raw):
