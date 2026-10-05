@@ -3,7 +3,8 @@
 
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
-                            [--exclude-dir PATH]... [--dry-run]
+                            [--exclude-dir PATH]... [--dry-run
+                            [--show-excluded]]
     python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
                             [--dry-run]
     python backup.py verify SNAPSHOT [--details]
@@ -30,6 +31,13 @@ backup 的 --dry-run 只完成备份前的全部校验并在标准输出打印�
 预览（source、snapshot、files、paths），不创建快照目录及其父目录、
 不复制文件、不生成清单或临时文件；paths 为本次收录的相对路径，
 按 Unicode 码点升序排列；--checksum 在预览中不计算摘要。
+
+--show-excluded 只能与 --dry-run 一起使用，在预览 JSON 中追加
+excluded_paths 字符串数组，列出本次被 --exclude 或 --exclude-dir
+剔除的普通文件（目录本身不列入），路径以 / 分隔、按 Unicode 码点
+升序排列；重复规则与父子目录重叠命中的文件只列一次，paths 与
+excluded_paths 不重叠且覆盖全部普通文件，未排除任何文件时该数组
+为空。不传 --show-excluded 时预览字段保持不变。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -263,9 +271,13 @@ def _sha256_of_file(path):
 
 
 def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
-               exclude_dirs=None, dry_run=False):
+               exclude_dirs=None, dry_run=False, show_excluded=False):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
+
+    # ---- --show-excluded 只能与 --dry-run 组合（不创建任何目标）----
+    if show_excluded and not dry_run:
+        fail("--show-excluded 只能与 --dry-run 一起使用")
 
     # ---- 校验 --exclude / --exclude-dir 排除值的形态（不创建任何目标）----
     # 两类参数共用同一形态校验与去重流程，仅报错文案不同；文件排除始终
@@ -302,17 +314,24 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
 
     # ---- 完整遍历源目录，确认全部为普通文件/目录 ----
     # 排除参数不绕过此处的完整安全检查：符号链接与非普通文件仍整体拒绝。
-    rel_paths = _collect_source_files(source_resolved)
+    all_rel_paths = _collect_source_files(source_resolved)
+    rel_paths = list(all_rel_paths)
 
     # ---- 排除路径必须与收集到的普通文件逐字匹配（目录等一律不匹配）----
     # 单文件排除始终按完整源目录判断：即使该文件同时位于被排除目录内，
     # 只要它是源目录中的普通文件即算匹配，不因目录排除而报错。
+    # excluded_path_set 汇总被两类规则剔除的普通文件（目录本身不计入），
+    # 仅供 --show-excluded 预览使用；单文件与目录规则重叠命中同一文件时
+    # 集合天然只记一次。
+    excluded_path_set = set()
     if excluded:
-        collected = set(rel_paths)
+        collected = set(all_rel_paths)
         for raw in excluded:
             if raw not in collected:
                 fail(f"排除项未匹配普通文件: {raw}")
         excluded_set = set(excluded)
+        if show_excluded:
+            excluded_path_set.update(excluded_set)
         rel_paths = [rel for rel in rel_paths if rel not in excluded_set]
 
     # ---- 排除目录必须与源目录中真实存在的目录逐字匹配 ----
@@ -327,6 +346,14 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
             if not _match_exclude_dir(source_resolved, raw):
                 fail(f"排除目录未匹配普通目录: {raw}")
             excluded_dir_set.add(raw)
+
+        # 目录剔除按完整收集结果统计：这样被单文件规则先剔除的文件若同时
+        # 位于被排除目录内，也只在 excluded_path_set 中出现一次。
+        if show_excluded:
+            excluded_path_set.update(
+                rel for rel in all_rel_paths
+                if _is_under_excluded_dir(rel, excluded_dir_set)
+            )
         rel_paths = [
             rel for rel in rel_paths
             if not _is_under_excluded_dir(rel, excluded_dir_set)
@@ -343,6 +370,10 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
             "files": len(rel_paths),
             "paths": rel_paths,
         }
+        if show_excluded:
+            # 仅列出被剔除的普通文件（目录本身不列入）：与 paths 不重叠，
+            # 二者并集恰为源目录全部普通文件；排序同 paths（码点升序）。
+            preview["excluded_paths"] = sorted(excluded_path_set)
         print(json.dumps(preview, ensure_ascii=False))
         return EXIT_OK
 
@@ -697,6 +728,14 @@ def build_parser():
              "其父目录、不复制文件、不生成清单或临时文件；"
              "paths 按 Unicode 码点升序排列；--checksum 不计算摘要",
     )
+    p_backup.add_argument(
+        "--show-excluded",
+        dest="show_excluded",
+        action="store_true",
+        help="只能与 --dry-run 一起使用；预览 JSON 追加 excluded_paths"
+             "数组，列出本次被 --exclude 或 --exclude-dir 剔除的普通"
+             "文件（目录本身不列入），按 Unicode 码点升序排列",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -750,7 +789,7 @@ def main(argv=None):
     if args.command == "backup":
         action = lambda: cmd_backup(
             args.source, args.snapshot, args.checksum, args.excludes,
-            args.exclude_dirs, args.dry_run,
+            args.exclude_dirs, args.dry_run, args.show_excluded,
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(

@@ -13,6 +13,9 @@ python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]... [--excl
 # 备份预览：只完成备份前校验并打印本次收录计划，不创建 SNAPSHOT、不复制文件
 python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]... [--exclude-dir PATH]... --dry-run
 
+# 备份预览并同时列出被排除的普通文件：--show-excluded 只能与 --dry-run 一起使用
+python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]... [--exclude-dir PATH]... --dry-run --show-excluded
+
 # 恢复：将 SNAPSHOT 恢复到新建的 DEST 目录
 python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
 
@@ -140,6 +143,27 @@ SNAPSHOT/
   在同一目标备份，清单路径与预览一致，文件字节与源文件一致。不带
   `--dry-run` 的 backup 输出、版本 1 清单及 restore、verify 的行为保持
   不变。
+
+### `--show-excluded`：预览同时列出被排除的普通文件
+
+- `--show-excluded` 只能与 `--dry-run` 一起使用；不传该选项时预览仍只
+  输出 source、snapshot、files、paths 四个字段，行为与旧版完全一致。
+  未与 `--dry-run` 同用时退出码 2、标准输出为空，标准错误包含
+  “--show-excluded 只能与 --dry-run 一起使用”，不创建任何目标。
+- 合法预览在原有四个字段之外追加 `excluded_paths` 字符串数组，列出本次
+  被 `--exclude` 或 `--exclude-dir` 剔除的**普通文件**：路径相对源目录、
+  使用 `/` 分隔，按 Unicode 码点升序排列，保留中文、空格与大小写。
+- 被排除的目录本身不列入数组；重复规则、父子目录或单文件与目录规则
+  重叠命中的文件只列一次；文件同时位于被排除目录内时，其单文件排除
+  仍按完整源目录匹配，不报“未匹配”。排除一个存在的空目录仍合法，
+  此时数组不新增条目。
+- `paths` 与 `excluded_paths` 不重叠，二者并集覆盖源目录全部普通文件；
+  未排除任何文件时 `excluded_paths` 为空数组；合法排除全部文件时
+  `files` 为 0、`paths` 为空数组。
+- 沿用全部备份前检查与现有错误原因，任一失败均退出码 2、标准输出为空，
+  被排除区域仍参与安全检查。预览成功与失败都不创建快照、父目录或任何
+  文件，不改动源目录与已有目标；与 `--checksum` 同用仍不读取文件内容、
+  不计算摘要。
 
 ## 摘要校验（恢复）
 
