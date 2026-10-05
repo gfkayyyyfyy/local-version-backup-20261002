@@ -134,18 +134,21 @@ def _collect_source_files(source):
     return collected
 
 
-def _validate_exclusions(exclusions):
-    """校验 --exclude 排除路径的形态，返回按输入顺序去重后的列表。
+def _validate_exclusion_values(values, invalid_reason):
+    """校验 backup 排除值的形态，返回按输入顺序去重后的列表；非法则失败。
 
-    排除路径以源目录为基准、使用 / 分隔，与文件相对路径逐字精确匹配：
-    仅拒绝空字符串、绝对路径、带盘符路径、反斜杠以及空/./.. 分量，
-    不做大小写转换、分隔符转换、目录展开或通配符匹配。
+    这是 backup 的 --exclude 与 --exclude-dir 共用的唯一形态校验与
+    去重流程：排除值以源目录为基准、使用 / 分隔，仅拒绝空字符串、绝对
+    路径、带盘符路径、反斜杠以及空/./.. 分量，保留大小写、中文与空格，
+    不做大小写转换、分隔符转换、目录展开或通配符匹配；重复值只保留
+    首次出现。是否与真实文件/目录逐字匹配在遍历源目录后另行判定。
+    invalid_reason 为形态非法时报告的原因前缀，报错逐字附上原始参数。
     """
     seen = set()
     selected = []
-    for raw in exclusions:
+    for raw in values:
         if _exclude_form_invalid(raw):
-            fail(f"排除路径无效: {raw}")
+            fail(f"{invalid_reason}: {raw}")
         if raw not in seen:
             seen.add(raw)
             selected.append(raw)
@@ -153,7 +156,11 @@ def _validate_exclusions(exclusions):
 
 
 def _exclude_form_invalid(raw):
-    """判断 --exclude / --exclude-dir 参数形态是否非法（非法返回 True）。"""
+    """判断排除值（backup 两类排除、restore 的 --dir 共用）形态是否非法。
+
+    共同形态规则：值为非空、不以 / 开头、不带 Windows 盘符、不含反
+    斜杠，且每个 / 分隔的路径分量都不为空、"." 或 ".."。
+    """
     if raw == "":
         return True
     if raw.startswith("/"):
@@ -169,23 +176,6 @@ def _exclude_form_invalid(raw):
         if part in ("", ".", ".."):
             return True
     return False
-
-
-def _validate_exclude_dirs(exclude_dirs):
-    """校验 --exclude-dir 排除目录路径的形态，返回按输入顺序去重后的列表。
-
-    形态规则与 --exclude 完全一致：仅拒绝空字符串、绝对路径、带盘符路径、
-    反斜杠以及空/./.. 分量；是否匹配真实目录在遍历源目录后另行判定。
-    """
-    seen = set()
-    selected = []
-    for raw in exclude_dirs:
-        if _exclude_form_invalid(raw):
-            fail(f"排除目录路径无效: {raw}")
-        if raw not in seen:
-            seen.add(raw)
-            selected.append(raw)
-    return selected
 
 
 def _match_exclude_dir(source_resolved, raw):
@@ -277,9 +267,16 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
 
-    # ---- 校验 --exclude / --exclude-dir 排除路径的形态（不创建任何目标）----
-    excluded = _validate_exclusions(excludes or [])
-    excluded_dirs = _validate_exclude_dirs(exclude_dirs or [])
+    # ---- 校验 --exclude / --exclude-dir 排除值的形态（不创建任何目标）----
+    # 两类参数共用同一形态校验与去重流程，仅报错文案不同；文件排除始终
+    # 先于目录排除校验，因此两类同时非法时先报告文件排除，与命令行中两
+    # 类参数的排列顺序无关。
+    excluded = _validate_exclusion_values(
+        excludes or [], "排除路径无效"
+    )
+    excluded_dirs = _validate_exclusion_values(
+        exclude_dirs or [], "排除目录路径无效"
+    )
 
     # ---- 校验源目录（此时绝不创建任何目标）----
     try:
@@ -518,7 +515,8 @@ def _validate_file_selection(selections):
 def _validate_dir_selection(directories):
     """校验 --dir 目录选择值的形态，返回按输入顺序去重后的列表。
 
-    形态规则与 --exclude 完全一致：仅拒绝空字符串、绝对路径、带盘符
+    形态规则与 backup 的两类排除值完全一致（共用
+    _exclude_form_invalid 形态判定）：仅拒绝空字符串、绝对路径、带盘符
     路径、反斜杠以及空/./.. 路径分量；保留大小写、中文与空格，不做
     分隔符转换、路径归一化或通配符展开。是否与清单匹配另行判定。
     """
