@@ -4,6 +4,7 @@
 用法:
     python backup.py backup SOURCE SNAPSHOT [--checksum] [--exclude PATH]...
                             [--exclude-dir PATH]... [--dry-run]
+                            [--show-excluded]
     python backup.py restore SNAPSHOT DEST [--file PATH]... [--dir PATH]...
                             [--dry-run]
     python backup.py verify SNAPSHOT [--details]
@@ -30,6 +31,11 @@ backup 的 --dry-run 只完成备份前的全部校验并在标准输出打印�
 预览（source、snapshot、files、paths），不创建快照目录及其父目录、
 不复制文件、不生成清单或临时文件；paths 为本次收录的相对路径，
 按 Unicode 码点升序排列；--checksum 在预览中不计算摘要。
+
+--show-excluded 只能与 --dry-run 一起使用；附带它的预览在原有四个
+字段之外额外输出 excluded_paths 字符串数组，列出本次被 --exclude 或
+--exclude-dir 剔除的普通文件相对路径（/ 分隔，按 Unicode 码点升序
+排列，去重，目录本身不列入）。不传该参数时预览字段与行为保持原样。
 
 快照目录结构:
     SNAPSHOT/data/...        保留相对目录结构的文件原始字节
@@ -263,9 +269,15 @@ def _sha256_of_file(path):
 
 
 def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
-               exclude_dirs=None, dry_run=False):
+               exclude_dirs=None, dry_run=False, show_excluded=False):
     source = Path(source_arg)
     snapshot = Path(snapshot_arg)
+
+    # ---- --show-excluded 只能与 --dry-run 一起使用 ----
+    # 参数组合错误属于可预先判定的命令行错误：退出码 2、标准输出为空，
+    # 且在任何源目录/目标检查之前报告，不创建任何文件或目录。
+    if show_excluded and not dry_run:
+        fail("--show-excluded 只能与 --dry-run 一起使用")
 
     # ---- 校验 --exclude / --exclude-dir 排除值的形态（不创建任何目标）----
     # 两类参数共用同一形态校验与去重流程，仅报错文案不同；文件排除始终
@@ -303,6 +315,11 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
     # ---- 完整遍历源目录，确认全部为普通文件/目录 ----
     # 排除参数不绕过此处的完整安全检查：符号链接与非普通文件仍整体拒绝。
     rel_paths = _collect_source_files(source_resolved)
+    # 收集结果已按 Unicode 码点升序排列；保留全集以便 --show-excluded
+    # 预览在过滤之后仍能区分“被剔除”与“被收录”的普通文件。
+    all_rel_paths = list(rel_paths)
+    excluded_file_set = set()
+    excluded_dir_set = set()
 
     # ---- 排除路径必须与收集到的普通文件逐字匹配（目录等一律不匹配）----
     # 单文件排除始终按完整源目录判断：即使该文件同时位于被排除目录内，
@@ -312,8 +329,8 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
         for raw in excluded:
             if raw not in collected:
                 fail(f"排除项未匹配普通文件: {raw}")
-        excluded_set = set(excluded)
-        rel_paths = [rel for rel in rel_paths if rel not in excluded_set]
+        excluded_file_set.update(excluded)
+        rel_paths = [rel for rel in rel_paths if rel not in excluded_file_set]
 
     # ---- 排除目录必须与源目录中真实存在的目录逐字匹配 ----
     # 源目录已经过完整安全检查（无符号链接、无非普通文件），此处 lstat 的
@@ -322,7 +339,6 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
     # 普通文件的路径一律拒绝，存在的空目录同样是合法匹配。重复指定与父子
     # 目录重叠自然取并集。
     if excluded_dirs:
-        excluded_dir_set = set()
         for raw in excluded_dirs:
             if not _match_exclude_dir(source_resolved, raw):
                 fail(f"排除目录未匹配普通目录: {raw}")
@@ -343,6 +359,15 @@ def cmd_backup(source_arg, snapshot_arg, checksum=False, excludes=None,
             "files": len(rel_paths),
             "paths": rel_paths,
         }
+        if show_excluded:
+            # 被剔除的普通文件 = 全集减去收录集：单文件规则、目录规则
+            # （含父子目录重叠）或两者重叠命中的文件自然只出现一次；
+            # 目录本身不是普通文件，不会出现在全集中。全集已按 Unicode
+            # 码点升序排列，过滤后顺序保持不变。
+            kept = set(rel_paths)
+            preview["excluded_paths"] = [
+                rel for rel in all_rel_paths if rel not in kept
+            ]
         print(json.dumps(preview, ensure_ascii=False))
         return EXIT_OK
 
@@ -697,6 +722,15 @@ def build_parser():
              "其父目录、不复制文件、不生成清单或临时文件；"
              "paths 按 Unicode 码点升序排列；--checksum 不计算摘要",
     )
+    p_backup.add_argument(
+        "--show-excluded",
+        dest="show_excluded",
+        action="store_true",
+        help="只能与 --dry-run 一起使用；预览 JSON 额外输出 "
+             "excluded_paths 数组，列出本次被 --exclude 或 --exclude-dir "
+             "剔除的普通文件相对路径（/ 分隔，按 Unicode 码点升序、"
+             "去重，目录本身不列入）",
+    )
 
     p_restore = subparsers.add_parser(
         "restore", help="将快照恢复到新建的目标目录"
@@ -750,7 +784,7 @@ def main(argv=None):
     if args.command == "backup":
         action = lambda: cmd_backup(
             args.source, args.snapshot, args.checksum, args.excludes,
-            args.exclude_dirs, args.dry_run,
+            args.exclude_dirs, args.dry_run, args.show_excluded,
         )
     elif args.command == "restore":
         action = lambda: cmd_restore(
